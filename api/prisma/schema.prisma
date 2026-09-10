@@ -1,0 +1,206 @@
+// Northline Atlas Dispatch — data model
+//
+// Tenancy: every ingest/read is scoped to a Workspace. A vendor delivers to a
+// specific per-workspace credential (VendorCredential), so the tenant is derived
+// from the *signing key*, never from user-controlled body fields.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "./generated"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Workspace {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+
+  memberships Membership[]
+  credentials VendorCredential[]
+  events      Event[]
+  workItems   WorkItem[]
+
+  @@map("workspaces")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  password      String   @default("") // bcrypt hash
+  createdAt     DateTime @default(now())
+
+  memberships   Membership[]
+  userRoles     UserRole[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+// --- RBAC (ported from the shared NestJS template) ---
+// Permissions are global action-capabilities (what you may do); Membership
+// controls tenant data-access (whose data you may touch). The two compose:
+// a user needs BOTH the permission AND workspace membership to act.
+
+model Permission {
+  id          String   @id @default(cuid())
+  name        String   @unique // e.g. "workitem:retry"
+  description String?
+  createdAt   DateTime @default(now())
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique // e.g. "ops-admin"
+  description String?
+  createdAt   DateTime @default(now())
+
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@map("roles")
+}
+
+model RolePermission {
+  id           String   @id @default(cuid())
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id        String   @id @default(cuid())
+  userId    String
+  roleId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @db.Text
+  revoked   Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Membership {
+  id          String   @id @default(cuid())
+  userId      String
+  workspaceId String
+  role        String   @default("member")
+  createdAt   DateTime @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+// A vendor's signing credential, bound to exactly one workspace.
+// keyId is sent in the `X-Webhook-Key` header; the matching secret verifies HMAC.
+model VendorCredential {
+  id          String   @id @default(cuid())
+  keyId       String   @unique
+  vendor      String
+  workspaceId String
+  secret      String // HMAC signing secret (would be KMS-managed in prod)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@map("vendor_credentials")
+}
+
+// Raw ingested event. Idempotency is enforced per (workspace, vendor, vendorEventId).
+model Event {
+  id            String   @id @default(cuid())
+  workspaceId   String
+  vendor        String
+  vendorEventId String
+  eventType     String?
+  payload       Json // raw parsed body (no secrets stored)
+  signature     String // the v1 signature we verified (audit trail)
+  receivedAt    DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workItem  WorkItem?
+
+  @@unique([workspaceId, vendor, vendorEventId])
+  @@index([workspaceId, receivedAt])
+  @@map("events")
+}
+
+enum WorkItemStatus {
+  pending
+  done
+  failed
+  dead
+}
+
+// The unit of work derived from an event. One event => one work item (idempotent).
+model WorkItem {
+  id          String         @id @default(cuid())
+  workspaceId String
+  eventId     String         @unique
+  vendor      String
+  status      WorkItemStatus @default(pending)
+  attempts    Int            @default(0)
+  maxAttempts Int            @default(3)
+  lastError   String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  workspace   Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  event       Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  transitions StatusTransition[]
+
+  @@index([workspaceId, status, createdAt])
+  @@map("work_items")
+}
+
+// Append-only status history for a work item (audit / detail view).
+model StatusTransition {
+  id         String          @id @default(cuid())
+  workItemId String
+  fromStatus WorkItemStatus?
+  toStatus   WorkItemStatus
+  attempt    Int
+  note       String?
+  createdAt  DateTime        @default(now())
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workItemId, createdAt])
+  @@map("status_transitions")
+}

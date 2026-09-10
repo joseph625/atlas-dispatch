@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+# Prisma client is generated into the repo — regenerate with `prisma generate`
+prisma/generated/
+
+# Env files are secret; only the example is committed
+.env
+.env.*
+!.env.example
